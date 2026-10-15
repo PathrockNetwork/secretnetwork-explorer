@@ -1,0 +1,682 @@
+/**
+ * Every derived metric the dashboard needs, as SQL against the chain-agnostic
+ * core schema. Nothing here is chain-specific.
+ *
+ * Two windows are used throughout: SHORT (1,000 blocks) and LONG (10,000).
+ * Counts are returned alongside percentages so the caller can tell a genuine
+ * 100% from a window that isn't backfilled yet — a partially-filled long
+ * window must render as "3,412 / 10k", never as a percentage.
+ */
+import type pg from "pg";
+
+export const SHORT_WINDOW = 1_000;
+export const LONG_WINDOW = 10_000;
+
+export type ChainRow = {
+  id: number;
+  slug: string;
+  name: string;
+  chain_id: string;
+  family: string;
+  rpc_url: string;
+  ws_url: string | null;
+  blockscout_url: string | null;
+  capabilities: { delegations: boolean; governance: boolean; slashing: boolean; poa: boolean };
+  meta: {
+    bech32Prefix: string | null;
+    denom: { display: string; base: string; exponent: number } | null;
+    lcdUrls: string[];
+  } | null;
+  latest_indexed_height: number | null;
+};
+
+/** The configured chain. Defaults to the lowest id when no slug is given. */
+export async function getChain(pool: pg.Pool, slug?: string): Promise<ChainRow | null> {
+  const r = slug
+    ? await pool.query<ChainRow>("select * from chains where slug = $1", [slug])
+    : await pool.query<ChainRow>("select * from chains order by id limit 1");
+  return r.rows[0] ?? null;
+}
+
+export type EndpointRow = {
+  id: number;
+  label: string;
+  rpc_url: string;
+  ws_url: string | null;
+  priority: number;
+  is_active: boolean;
+  pinned: boolean;
+  healthy: boolean;
+  last_height: number | null;
+  latency_ms: number | null;
+  last_ok_at: Date | null;
+  last_error: string | null;
+  consecutive_failures: number;
+};
+
+export async function listEndpoints(pool: pg.Pool, chainId: number): Promise<EndpointRow[]> {
+  const r = await pool.query<EndpointRow>(
+    `select id, label, rpc_url, ws_url, priority, is_active, pinned, healthy,
+            last_height, latency_ms, last_ok_at, last_error, consecutive_failures
+     from chain_endpoints where chain_id = $1
+     order by priority, id`,
+    [chainId],
+  );
+  return r.rows;
+}
+
+/**
+ * Pin or unpin an endpoint. Pinning also makes it active immediately so the UI
+ * reflects the choice without waiting for the indexer's next probe; the indexer
+ * converges on the same row from `pinned`.
+ */
+export async function setEndpointPinned(
+  pool: pg.Pool,
+  chainId: number,
+  id: number,
+  pinned: boolean,
+): Promise<EndpointRow | null> {
+  const owned = await pool.query<{ id: number }>(
+    `select id from chain_endpoints where chain_id = $1 and id = $2`,
+    [chainId, id],
+  );
+  if (owned.rowCount === 0) return null;
+
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    // At most one pin per chain, and the partial unique index allows only one
+    // active row — clear both before setting.
+    await client.query(`update chain_endpoints set pinned = false where chain_id = $1`, [chainId]);
+    if (pinned) {
+      await client.query(
+        `update chain_endpoints set is_active = false where chain_id = $1 and is_active`,
+        [chainId],
+      );
+      await client.query(
+        `update chain_endpoints set pinned = true, is_active = true, updated_at = now() where id = $1`,
+        [id],
+      );
+      await client.query(
+        `update chains c set rpc_url = e.rpc_url, ws_url = e.ws_url, updated_at = now()
+         from chain_endpoints e where e.id = $1 and c.id = $2`,
+        [id, chainId],
+      );
+    }
+    await client.query("commit");
+  } catch (e) {
+    await client.query("rollback");
+    throw e;
+  } finally {
+    client.release();
+  }
+
+  const r = await pool.query<EndpointRow>(
+    `select id, label, rpc_url, ws_url, priority, is_active, pinned, healthy,
+            last_height, latency_ms, last_ok_at, last_error, consecutive_failures
+     from chain_endpoints where id = $1`,
+    [id],
+  );
+  return r.rows[0] ?? null;
+}
+
+/** Blocks' worth of silence before the indexer counts as stalled on time alone. */
+export const STALL_BLOCK_MULTIPLE = 20;
+/** Floor on the stall threshold so a fast chain can't produce a sub-minute one. */
+export const STALL_MIN_SECONDS = 60;
+/** Assumed block time when none has been measured yet (matches typical cadence). */
+export const FALLBACK_BLOCK_TIME_S = 5;
+
+export type StallInfo = {
+  /** Seconds since the newest indexed block; null when nothing is indexed. */
+  sinceLastBlockS: number | null;
+  /** How much silence counts as stalled, derived from the measured block time. */
+  staleAfterS: number;
+  stale: boolean;
+};
+
+/**
+ * Is the indexer stalled, judged on time alone?
+ *
+ * Lag needs a reachable RPC, but an unreachable RPC is exactly when indexing
+ * has stopped — relying on lag alone reports "normal" while nothing is being
+ * ingested. Time since the last indexed block needs no RPC, so it catches that
+ * case.
+ */
+export function indexerStall(
+  n: Pick<NetworkRow, "last_block_time" | "avg_block_time_ms">,
+  nowMs: number = Date.now(),
+): StallInfo {
+  const blockTimeS =
+    n.avg_block_time_ms !== null ? n.avg_block_time_ms / 1000 : FALLBACK_BLOCK_TIME_S;
+  const staleAfterS = Math.max(STALL_MIN_SECONDS, blockTimeS * STALL_BLOCK_MULTIPLE);
+  const sinceLastBlockS =
+    n.last_block_time !== null ? (nowMs - new Date(n.last_block_time).getTime()) / 1000 : null;
+  return {
+    sinceLastBlockS,
+    staleAfterS,
+    stale: sinceLastBlockS !== null && sinceLastBlockS > staleAfterS,
+  };
+}
+
+export type NetworkRow = {
+  latest_indexed_height: number | null;
+  earliest_indexed_height: number | null;
+  blocks_indexed: number;
+  last_block_time: Date | null;
+  avg_block_time_ms: number | null;
+  active_validators: number;
+  total_validators: number;
+  blocks_indexed_24h: number;
+  signing_rate_100: number | null;
+  /** Share of the set's voting power that committed, trailing 100 blocks. */
+  signing_power_online: number | null;
+  /**
+   * Blocks present *within the trailing long window*, not the total row count.
+   * A gap-filling backfill has plenty of rows overall while the recent window
+   * is still sparse — counting all rows would report a complete window and
+   * suppress the backfill banner.
+   */
+  blocks_in_long_window: number;
+};
+
+export async function networkSummary(pool: pg.Pool, chainId: number): Promise<NetworkRow> {
+  const r = await pool.query<NetworkRow>(
+    `
+    with b as (
+      select max(height) as latest, min(height) as earliest,
+             count(*)::int as total, max(time) as last_time
+      from blocks where chain_id = $1
+    ),
+    recent as (
+      select height, time, signature_count, validator_count,
+             extract(epoch from (time - lag(time) over (order by height)))::float8 as dt
+      from (
+        select height, time, signature_count, validator_count
+        from blocks where chain_id = $1 order by height desc limit 100
+      ) newest
+    ),
+    bt as (
+      -- Per-block deltas with the same sanity filter used everywhere else:
+      -- a gap inside the window (outage, then catch-up) would otherwise be
+      -- spread across the average and report absurd block times.
+      select avg(dt) filter (where dt > 0 and dt < 600)::float8 * 1000 as avg_ms,
+             sum(signature_count)::float8 / nullif(sum(validator_count), 0) * 100 as rate
+      from recent
+    ),
+    v as (
+      select count(*)::int as total,
+             count(*) filter (where is_active)::int as active
+      from validators where chain_id = $1
+    ),
+    d as (
+      select count(*)::int as n from blocks
+      where chain_id = $1 and time > now() - interval '24 hours'
+    ),
+    lw as (
+      select count(*)::int as n from blocks
+      where chain_id = $1 and height > (select latest from b) - $2
+    ),
+    pw as (
+      -- Signing power online: share of the set's capacity that actually
+      -- committed, over the trailing 100 blocks. With equal voting power
+      -- (PoA) this is the signature rate; kept as its own figure so the
+      -- meaning survives if powers ever diverge.
+      select sum(signature_count)::float8 / nullif(sum(validator_count), 0) * 100 as pct
+      from (
+        select signature_count, validator_count
+        from blocks where chain_id = $1 order by height desc limit 100
+      ) recent
+    )
+    select b.latest as latest_indexed_height,
+           b.earliest as earliest_indexed_height,
+           b.total as blocks_indexed,
+           b.last_time as last_block_time,
+           bt.avg_ms as avg_block_time_ms,
+           v.active as active_validators,
+           v.total as total_validators,
+           d.n as blocks_indexed_24h,
+           bt.rate as signing_rate_100,
+           pw.pct as signing_power_online,
+           lw.n as blocks_in_long_window
+    from b, bt, v, d, lw, pw
+    `,
+    [chainId, LONG_WINDOW],
+  );
+  return r.rows[0];
+}
+
+/** One block in the consensus pipeline strip. */
+export type PipelineBlock = {
+  height: number;
+  hash: string | null;
+  time: Date;
+  proposer_address: string | null;
+  moniker: string | null;
+  identity: string | null;
+  avatar_url: string | null;
+  tx_count: number | null;
+  signature_count: number | null;
+  validator_count: number | null;
+  round: number | null;
+};
+
+/**
+ * The newest blocks with proposer identity, votes and consensus round — the
+ * data behind the "block journey" strip. Round is null on the newest block
+ * until its successor's commit arrives (see schema note on blocks.round).
+ */
+export async function pipelineBlocks(pool: pg.Pool, chainId: number, limit = 8): Promise<PipelineBlock[]> {
+  const r = await pool.query<PipelineBlock>(
+    `select b.height, b.hash, b.time, b.proposer_address, v.moniker, v.identity,
+            b.tx_count, b.signature_count, b.validator_count, b.round
+     from blocks b
+     left join validators v on v.chain_id = b.chain_id and v.address = b.proposer_address
+     where b.chain_id = $1
+     order by b.height desc
+     limit $2`,
+    [chainId, limit],
+  );
+  return r.rows.reverse(); // oldest → newest, left to right in the strip
+}
+
+/** One entry in the public RPC directory. */
+export type DirectoryRow = {
+  url: string;
+  source: "configured" | "discovered";
+  label: string | null;
+  healthy: boolean;
+  latency_ms: number | null;
+  last_height: number | null;
+  catching_up: boolean | null;
+  earliest_height: number | null;
+  first_seen: Date | null;
+  last_seen: Date | null;
+};
+
+/**
+ * The public RPC directory: configured endpoints (the indexer's own
+ * rotation, with its health probes) plus community endpoints discovered on
+ * the P2P network. Configured first (they're verified), then discovered by
+ * latency. Discovery rows are evidence about what nodes said of themselves
+ * — see the schema note on discovered_endpoints for why they never join
+ * the rotation automatically.
+ */
+export async function rpcDirectory(pool: pg.Pool, chainId: number): Promise<DirectoryRow[]> {
+  const r = await pool.query<DirectoryRow>(
+    `select e.rpc_url as url, 'configured' as source, e.label,
+            e.healthy, e.latency_ms, e.last_height,
+            null::boolean as catching_up, null::int as earliest_height,
+            null::timestamptz as first_seen, null::timestamptz as last_seen
+     from chain_endpoints e where e.chain_id = $1
+     union all
+     select d.url, 'discovered' as source, d.moniker as label,
+            d.healthy, d.latency_ms, d.latest_height as last_height,
+            d.catching_up, d.earliest_height,
+            d.first_seen_at as first_seen, d.last_seen_at as last_seen
+     from discovered_endpoints d where d.chain_id = $1
+     order by source, healthy desc, latency_ms nulls last`,
+    [chainId],
+  );
+  return r.rows;
+}
+
+export type ValidatorRow = {
+  address: string;
+  moniker: string | null;
+  identity: string | null;
+  label: string | null;
+  watched: boolean;
+  pub_key: string | null;
+  voting_power: number | null;
+  is_active: boolean;
+  first_seen_height: number | null;
+  last_seen_height: number | null;
+  slots_short: number;
+  signed_short: number;
+  slots_long: number;
+  signed_long: number;
+  last_signed_height: number | null;
+  missed_streak: number;
+  proposed_short: number;
+  /** x/staking + x/slashing view; null until the LCD sync has run. */
+  operator_address: string | null;
+  website: string | null;
+  details: string | null;
+  commission_rate: number | null;
+  tokens: string | null;
+  min_self_delegation: string | null;
+  bond_status: string | null;
+  jailed: boolean | null;
+  missed_blocks_counter: number | null;
+  jailed_until: Date | null;
+  tombstoned: boolean | null;
+  signing_start_height: number | null;
+  /** Observed P2P node location; all-null when never seen (see locations.ts). */
+  loc_ip: string | null;
+  loc_country_code: string | null;
+  loc_country: string | null;
+  loc_city: string | null;
+  loc_isp: string | null;
+  loc_lat: number | null;
+  loc_lon: number | null;
+  loc_last_seen: Date | null;
+  loc_source: string | null;
+  loc_ips_seen: number | null;
+};
+
+/**
+ * Per-validator signing metrics over both windows in one pass.
+ *
+ * `missed_streak` counts consecutive misses since the validator's most recent
+ * signed block — a validator that has never signed inside the window counts
+ * every slot in it, which is the intended "hard down" reading.
+ */
+export async function validatorMetrics(pool: pg.Pool, chainId: number): Promise<ValidatorRow[]> {
+  const r = await pool.query<ValidatorRow>(
+    `
+    with head as (
+      select coalesce(max(height), 0) as h from blocks where chain_id = $1
+    ),
+    sig as (
+      select bs.validator_address as address, bs.height, bs.signed
+      from block_signatures bs, head
+      where bs.chain_id = $1 and bs.height > head.h - $3
+    ),
+    agg as (
+      select s.address,
+             count(*) filter (where s.height > (select h from head) - $2)::int as slots_short,
+             count(*) filter (where s.height > (select h from head) - $2 and s.signed)::int as signed_short,
+             count(*)::int as slots_long,
+             count(*) filter (where s.signed)::int as signed_long,
+             max(s.height) filter (where s.signed) as last_signed_height
+      from sig s group by s.address
+    ),
+    streak as (
+      select address, count(*)::int as missed_streak
+      from (
+        select address, height, signed,
+               max(height) filter (where signed) over (partition by address) as last_signed
+        from sig
+      ) t
+      where not signed and height > coalesce(last_signed, -1)
+      group by address
+    ),
+    prop as (
+      select b.proposer_address as address, count(*)::int as proposed
+      from blocks b, head
+      where b.chain_id = $1 and b.height > head.h - $2 and b.proposer_address is not null
+      group by b.proposer_address
+    )
+    select v.address, v.moniker, v.identity, v.avatar_url, v.label, v.watched, v.pub_key, v.voting_power, v.is_active,
+           v.first_seen_height, v.last_seen_height,
+           coalesce(a.slots_short, 0) as slots_short,
+           coalesce(a.signed_short, 0) as signed_short,
+           coalesce(a.slots_long, 0) as slots_long,
+           coalesce(a.signed_long, 0) as signed_long,
+           a.last_signed_height,
+           coalesce(s.missed_streak, 0) as missed_streak,
+           coalesce(p.proposed, 0) as proposed_short,
+           v.operator_address, v.website, v.details, v.commission_rate, v.tokens,
+           v.min_self_delegation, v.bond_status, v.jailed, v.missed_blocks_counter,
+           v.jailed_until, v.tombstoned, v.signing_start_height,
+           loc.ip as loc_ip, loc.country_code as loc_country_code, loc.country as loc_country,
+           loc.city as loc_city, loc.isp as loc_isp, loc.lat as loc_lat, loc.lon as loc_lon,
+           loc.last_seen_at as loc_last_seen,
+           loc.source as loc_source,
+           (select count(*)::int from validator_location_ips h
+             where h.chain_id = v.chain_id and h.validator_address = v.address) as loc_ips_seen
+    from validators v
+    left join agg a on a.address = v.address
+    left join streak s on s.address = v.address
+    left join prop p on p.address = v.address
+    left join validator_locations loc
+      on loc.chain_id = v.chain_id and loc.validator_address = v.address
+    where v.chain_id = $1
+    order by v.is_active desc, v.address
+    `,
+    [chainId, SHORT_WINDOW, LONG_WINDOW],
+  );
+  return r.rows;
+}
+
+/** Blocks proposed in the short window — denominator for proposer share. */
+export async function proposedTotal(pool: pg.Pool, chainId: number): Promise<number> {
+  const r = await pool.query<{ n: number }>(
+    `with head as (select coalesce(max(height), 0) as h from blocks where chain_id = $1)
+     select count(*)::int as n from blocks b, head
+     where b.chain_id = $1 and b.height > head.h - $2 and b.proposer_address is not null`,
+    [chainId, SHORT_WINDOW],
+  );
+  return r.rows[0]?.n ?? 0;
+}
+
+/**
+ * Set a validator's local identity: an operator-assigned label and/or a
+ * "watched" flag. A chain may expose no monikers, so this is the only way an
+ * operator can answer "is mine healthy?" — and it must survive the indexer's
+ * validator-set sync, which is why it lives in its own columns rather than
+ * overwriting `moniker`.
+ */
+export type ValidatorIdentityRow = {
+  address: string;
+  moniker: string | null;
+  label: string | null;
+  watched: boolean;
+};
+
+export async function setValidatorIdentity(
+  pool: pg.Pool,
+  chainId: number,
+  address: string,
+  patch: { label?: string | null; watched?: boolean },
+): Promise<ValidatorIdentityRow | null> {
+  const sets: string[] = [];
+  const args: unknown[] = [chainId, address];
+  if (patch.label !== undefined) {
+    const trimmed = patch.label === null ? null : patch.label.trim().slice(0, 64) || null;
+    args.push(trimmed);
+    sets.push(`label = $${args.length}`);
+  }
+  if (patch.watched !== undefined) {
+    args.push(patch.watched);
+    sets.push(`watched = $${args.length}`);
+  }
+  if (sets.length === 0) return null;
+
+  args.push(new Date());
+  const r = await pool.query(
+    `update validators set ${sets.join(", ")}, updated_at = $${args.length}
+     where chain_id = $1 and address = $2`,
+    args,
+  );
+  if (r.rowCount === 0) return null;
+
+  const back = await pool.query<ValidatorIdentityRow>(
+    `select address, moniker, label, watched
+     from validators where chain_id = $1 and address = $2`,
+    [chainId, address],
+  );
+  return back.rows[0] ?? null;
+}
+
+export type SlotRow = { height: number; signed: boolean | null; time: Date };
+
+/**
+ * Signing slots for the heatmap, newest first. Left-joined against `blocks` so
+ * heights where the validator was outside the set come back as `signed: null`
+ * ("not in set") rather than silently vanishing.
+ */
+export async function signingSlots(
+  pool: pg.Pool,
+  chainId: number,
+  address: string,
+  limit: number,
+): Promise<SlotRow[]> {
+  const r = await pool.query<SlotRow>(
+    `select b.height, bs.signed, b.time
+     from blocks b
+     left join block_signatures bs
+       on bs.chain_id = b.chain_id and bs.height = b.height and bs.validator_address = $2
+     where b.chain_id = $1
+     order by b.height desc
+     limit $3`,
+    [chainId, address, limit],
+  );
+  return r.rows;
+}
+
+export type SetChangeRow = {
+  height: number;
+  validator_address: string;
+  change_type: string;
+  voting_power_before: number | null;
+  voting_power_after: number | null;
+  time: Date;
+};
+
+export async function setChanges(
+  pool: pg.Pool,
+  chainId: number,
+  limit: number,
+): Promise<SetChangeRow[]> {
+  const r = await pool.query<SetChangeRow>(
+    `select height, validator_address, change_type, voting_power_before, voting_power_after, time
+     from validator_set_changes where chain_id = $1
+     order by height desc, id desc limit $2`,
+    [chainId, limit],
+  );
+  return r.rows;
+}
+
+/**
+ * True when every recorded change is an "added" at one height — i.e. the
+ * genesis set was captured and no churn has happened since. The UI says so
+ * explicitly rather than implying the chain has been stable through churn.
+ */
+export async function isBootstrapSet(pool: pg.Pool, chainId: number): Promise<boolean> {
+  const r = await pool.query<{ heights: number; removals: number; total: number }>(
+    `select count(distinct height)::int as heights,
+            count(*) filter (where change_type = 'removed')::int as removals,
+            count(*)::int as total
+     from validator_set_changes where chain_id = $1`,
+    [chainId],
+  );
+  const row = r.rows[0];
+  if (!row || row.total === 0) return false;
+  return row.heights === 1 && row.removals === 0;
+}
+
+export type BucketRow = {
+  bucket: Date;
+  block_time_s: number | null;
+  signing_rate: number | null;
+  n: number;
+};
+
+/** Block-time and signing-rate series, bucketed across a trailing window. */
+export async function seriesBuckets(
+  pool: pg.Pool,
+  chainId: number,
+  windowMinutes: number,
+  buckets: number,
+): Promise<BucketRow[]> {
+  const width = `${Math.max(1, Math.round((windowMinutes * 60) / buckets))} seconds`;
+  const r = await pool.query<BucketRow>(
+    `
+    with b as (
+      select time, signature_count, validator_count,
+             extract(epoch from (time - lag(time) over (order by height)))::float8 as dt
+      from blocks
+      where chain_id = $1 and time > now() - ($2 || ' minutes')::interval
+    )
+    select date_bin($3::interval, time, now() - ($2 || ' minutes')::interval) as bucket,
+           avg(dt) filter (where dt > 0 and dt < 600) as block_time_s,
+           sum(signature_count)::float8 / nullif(sum(validator_count), 0) * 100 as signing_rate,
+           count(*)::int as n
+    from b
+    group by bucket order by bucket
+    `,
+    [chainId, windowMinutes, width],
+  );
+  return r.rows;
+}
+
+export type RecentBlockRow = { height: number; signature_count: number | null; validator_count: number | null };
+
+/**
+ * Per-block signature counts for the newest N blocks, oldest first — backs the
+ * 100-segment signing strip, which needs block granularity rather than an
+ * average.
+ */
+export async function recentBlockSigning(
+  pool: pg.Pool,
+  chainId: number,
+  limit: number,
+): Promise<RecentBlockRow[]> {
+  const r = await pool.query<RecentBlockRow>(
+    `select height, signature_count, validator_count from (
+       select height, signature_count, validator_count
+       from blocks where chain_id = $1 order by height desc limit $2
+     ) t order by height asc`,
+    [chainId, limit],
+  );
+  return r.rows;
+}
+
+export type HourRow = { hour: Date; n: number };
+
+/** Block counts bucketed per hour (≤48h horizons) or per day (longer ones). */
+export type VolumeRow = { t: Date; n: number };
+
+export async function blocksPerBucket(
+  pool: pg.Pool,
+  chainId: number,
+  hours: number,
+): Promise<{ unit: "hour" | "day"; rows: VolumeRow[] }> {
+  const unit: "hour" | "day" = hours <= 48 ? "hour" : "day";
+  const r = await pool.query<VolumeRow>(
+    `select date_trunc($3, time) as t, count(*)::int as n
+     from blocks where chain_id = $1 and time > now() - ($2 || ' hours')::interval
+     group by t order by t`,
+    [chainId, hours, unit],
+  );
+  return { unit, rows: r.rows };
+}
+
+export type MetricStatsRow = {
+  avg_block_time_s: number | null;
+  p95_block_time_s: number | null;
+  blocks: number;
+  signing_rate: number | null;
+};
+
+/**
+ * Consensus stats over a trailing horizon of `hours`. A 24h window empties
+ * after any long outage — the wider horizons are what keep history visible
+ * through one.
+ */
+export async function metricStats(
+  pool: pg.Pool,
+  chainId: number,
+  hours: number = 24,
+): Promise<MetricStatsRow> {
+  const r = await pool.query<MetricStatsRow>(
+    `
+    with b as (
+      select signature_count, validator_count,
+             extract(epoch from (time - lag(time) over (order by height)))::float8 as dt
+      from blocks
+      where chain_id = $1 and time > now() - ($2 || ' hours')::interval
+    )
+    select avg(dt) filter (where dt > 0 and dt < 600) as avg_block_time_s,
+           percentile_cont(0.95) within group (order by dt)
+             filter (where dt > 0 and dt < 600) as p95_block_time_s,
+           count(*)::int as blocks,
+           sum(signature_count)::float8 / nullif(sum(validator_count), 0) * 100 as signing_rate
+    from b
+    `,
+    [chainId, hours],
+  );
+  return r.rows[0];
+}
