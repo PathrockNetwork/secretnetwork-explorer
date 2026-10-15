@@ -1,0 +1,381 @@
+import { sql } from "drizzle-orm";
+import {
+  boolean,
+  doublePrecision,
+  index,
+  integer,
+  jsonb,
+  pgTable,
+  primaryKey,
+  serial,
+  text,
+  timestamp,
+  uniqueIndex,
+} from "drizzle-orm/pg-core";
+
+/**
+ * Per-chain capability flags. Chain quirks live here (JSONB) instead of in
+ * dedicated columns, so the schema stays chain-agnostic. Secret (x/staking)
+ * sets delegations/governance/slashing = true, poa = false; a PoA chain such
+ * as Mezo flips them.
+ */
+export type ChainCapabilities = {
+  delegations: boolean;
+  governance: boolean;
+  slashing: boolean;
+  poa: boolean;
+};
+
+/** Display metadata the API and dashboard need; null fields are simply unknown. */
+export type ChainMeta = {
+  bech32Prefix: string | null;
+  denom: { display: string; base: string; exponent: number } | null;
+  /** LCD base URLs in failover order, for API reads (governance, txs). */
+  lcdUrls: string[];
+};
+
+/** One row per configured chain. Seeded from chains/*.yaml on indexer start. */
+export const chains = pgTable("chains", {
+  id: serial("id").primaryKey(),
+  slug: text("slug").notNull().unique(),
+  name: text("name").notNull(),
+  chainId: text("chain_id").notNull().unique(), // cosmos chain-id, e.g. "secret-4"
+  family: text("family").notNull(), // "cometbft"
+  rpcUrl: text("rpc_url").notNull(),
+  wsUrl: text("ws_url"),
+  blockscoutUrl: text("blockscout_url"), // outbound deep-links only
+  capabilities: jsonb("capabilities").$type<ChainCapabilities>().notNull(),
+  meta: jsonb("meta").$type<ChainMeta>(),
+  latestIndexedHeight: integer("latest_indexed_height"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/**
+ * RPC endpoints available for a chain. Seeded from `chains/*.yaml` (the source
+ * of truth for *which* endpoints exist) while selection and health live here,
+ * so a node chosen in the UI survives a restart instead of being overwritten
+ * by the config upsert.
+ */
+export const chainEndpoints = pgTable(
+  "chain_endpoints",
+  {
+    id: serial("id").primaryKey(),
+    chainId: integer("chain_id")
+      .notNull()
+      .references(() => chains.id, { onDelete: "cascade" }),
+    label: text("label").notNull(), // e.g. "primary", "backup"
+    rpcUrl: text("rpc_url").notNull(),
+    wsUrl: text("ws_url"),
+    /** Lower wins when several endpoints are healthy. */
+    priority: integer("priority").notNull().default(100),
+
+    /** Exactly one active endpoint per chain (enforced by a partial index). */
+    isActive: boolean("is_active").notNull().default(false),
+    /** A manual choice: automatic failover must not override it. */
+    pinned: boolean("pinned").notNull().default(false),
+
+    healthy: boolean("healthy").notNull().default(false),
+    lastHeight: integer("last_height"),
+    latencyMs: integer("latency_ms"),
+    lastOkAt: timestamp("last_ok_at", { withTimezone: true }),
+    lastError: text("last_error"),
+    consecutiveFailures: integer("consecutive_failures").notNull().default(0),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    // Idempotent YAML upserts key on the URL.
+    chainUrlUniq: uniqueIndex("chain_endpoints_chain_url_idx").on(t.chainId, t.rpcUrl),
+    oneActivePerChain: uniqueIndex("chain_endpoints_one_active_idx")
+      .on(t.chainId)
+      .where(sql`${t.isActive}`),
+    byChain: index("chain_endpoints_chain_idx").on(t.chainId),
+  }),
+);
+
+/** Known validators per chain (consensus address = signer/proposer identity). */
+export const validators = pgTable(
+  "validators",
+  {
+    id: serial("id").primaryKey(),
+    chainId: integer("chain_id")
+      .notNull()
+      .references(() => chains.id, { onDelete: "cascade" }),
+    address: text("address").notNull(), // consensus address (hex)
+    pubKey: text("pub_key"), // consensus public key
+    moniker: text("moniker"), // best-effort, nullable (PoA may expose no moniker)
+    /**
+     * Keybase identity (16- or 64-hex) from the staking/poa description, nullable. Resolved
+     * to the operator's real logo by the API; a null here means the chain
+     * exposed no identity, not that the validator has none.
+     */
+    identity: text("identity"),
+    /**
+     * Operator logo URL from a third-party profile source, used when no
+     * Keybase identity resolves. Nothing writes it on Secret today; kept so a
+     * curated source can be added without a migration.
+     */
+    avatarUrl: text("avatar_url"),
+    /**
+     * Local, operator-assigned identity ("Ours", "Broker X"). Never written by
+     * ingestion, so it survives moniker changes on chain.
+     */
+    label: text("label"),
+    /** Marks validators this operator cares about; surfaced across the UI. */
+    watched: boolean("watched").notNull().default(false),
+    votingPower: integer("voting_power").default(0),
+
+    /*
+     * x/staking + x/slashing view, synced from the LCD on chains with
+     * capabilities.delegations. All nullable: null means "not synced yet" (or
+     * a chain without staking), never zero.
+     */
+    operatorAddress: text("operator_address"), // secretvaloper1…
+    website: text("website"),
+    details: text("details"),
+    /** Commission rate as a decimal fraction (0.05 = 5%). */
+    commissionRate: doublePrecision("commission_rate"),
+    /** Bonded tokens in base denom (uscrt). Text: exceeds int range. */
+    tokens: text("tokens"),
+    minSelfDelegation: text("min_self_delegation"),
+    /** BOND_STATUS_BONDED | BOND_STATUS_UNBONDING | BOND_STATUS_UNBONDED */
+    bondStatus: text("bond_status"),
+    jailed: boolean("jailed"),
+    missedBlocksCounter: integer("missed_blocks_counter"),
+    jailedUntil: timestamp("jailed_until", { withTimezone: true }),
+    tombstoned: boolean("tombstoned"),
+    signingStartHeight: integer("signing_start_height"),
+    stakingSyncedAt: timestamp("staking_synced_at", { withTimezone: true }),
+
+    isActive: boolean("is_active").notNull().default(true),
+    firstSeenHeight: integer("first_seen_height"),
+    lastSeenHeight: integer("last_seen_height"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    chainAddressUniq: uniqueIndex("validators_chain_address_idx").on(t.chainId, t.address),
+    byChain: index("validators_chain_idx").on(t.chainId),
+  }),
+);
+
+/**
+ * RPC endpoints discovered from the chain's own P2P network: peers seen in
+ * /net_info whose RPC port answers /status on our chain. Evidence-based —
+ * every row carries what the node reported (moniker, archive depth, sync
+ * state) at last probe. Listed on the public RPC directory; NOT part of the
+ * indexer's failover rotation, which stays verified-by-human only: an
+ * unvetted node serving fabricated blocks would poison the uptime numbers
+ * this tool exists to report.
+ */
+export const discoveredEndpoints = pgTable(
+  "discovered_endpoints",
+  {
+    id: serial("id").primaryKey(),
+    chainId: integer("chain_id")
+      .notNull()
+      .references(() => chains.id, { onDelete: "cascade" }),
+    url: text("url").notNull(),
+    /** Moniker the node announced in its /status node_info. */
+    moniker: text("moniker"),
+    network: text("network").notNull(),
+    /** Last probe answered with our chain and was in sync. */
+    healthy: boolean("healthy").notNull().default(true),
+    catchingUp: boolean("catching_up").notNull().default(false),
+    earliestHeight: integer("earliest_height"),
+    latestHeight: integer("latest_height"),
+    latencyMs: integer("latency_ms"),
+    timesSeen: integer("times_seen").notNull().default(1),
+    firstSeenAt: timestamp("first_seen_at", { withTimezone: true }).notNull().defaultNow(),
+    lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    chainUrlUniq: uniqueIndex("discovered_endpoints_url_idx").on(t.chainId, t.url),
+    byChain: index("discovered_endpoints_chain_idx").on(t.chainId),
+  }),
+);
+
+/**
+ * Last-observed network location per validator.
+ *
+ * The chain carries no geography; this is derived from what the P2P network
+ * itself discloses. CometBFT peers announce a moniker + IP in the handshake,
+ * so a periodic /net_info sweep across the configured RPCs, matched by moniker
+ * onto the known validator set, yields the node's observed IP — and geo-IP
+ * yields where that node runs. Honest semantics: this is where a node with
+ * the validator's moniker was last seen peering, not a registry entry; a
+ * validator behind sentries shows its sentry. Missing rows mean "never
+ * observed", never "unknown = 0".
+ */
+export const validatorLocations = pgTable(
+  "validator_locations",
+  {
+    id: serial("id").primaryKey(),
+    chainId: integer("chain_id")
+      .notNull()
+      .references(() => chains.id, { onDelete: "cascade" }),
+    validatorAddress: text("validator_address").notNull(),
+    /** Moniker as announced in the P2P handshake (evidence for the match). */
+    monikerSeen: text("moniker_seen").notNull(),
+    ip: text("ip").notNull(),
+    countryCode: text("country_code"),
+    country: text("country"),
+    city: text("city"),
+    isp: text("isp"),
+    /** Coordinates from geo-IP (equirectangular degrees) for the map view. */
+    lat: doublePrecision("lat"),
+    lon: doublePrecision("lon"),
+    /** Monotonically increasing observation counter across sweeps. */
+    timesSeen: integer("times_seen").notNull().default(1),
+    /** How this sighting arrived: "peer" via /net_info, "direct" by probing
+     *  the node's own RPC after it fell out of the peer view. */
+    source: text("source").notNull().default("peer"),
+    firstSeenAt: timestamp("first_seen_at", { withTimezone: true }).notNull().defaultNow(),
+    lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    chainAddressUniq: uniqueIndex("validator_locations_chain_address_idx").on(t.chainId, t.validatorAddress),
+    byChain: index("validator_locations_chain_idx").on(t.chainId),
+  }),
+);
+
+/**
+ * Every IP ever observed per validator — the history behind the latest-only
+ * `validator_locations` row. An IP change (failover, migration, provider
+ * switch) is a signal worth keeping, not overwriting.
+ */
+export const validatorLocationIps = pgTable(
+  "validator_location_ips",
+  {
+    id: serial("id").primaryKey(),
+    chainId: integer("chain_id")
+      .notNull()
+      .references(() => chains.id, { onDelete: "cascade" }),
+    validatorAddress: text("validator_address").notNull(),
+    ip: text("ip").notNull(),
+    countryCode: text("country_code"),
+    country: text("country"),
+    city: text("city"),
+    isp: text("isp"),
+    lat: doublePrecision("lat"),
+    lon: doublePrecision("lon"),
+    timesSeen: integer("times_seen").notNull().default(1),
+    firstSeenAt: timestamp("first_seen_at", { withTimezone: true }).notNull().defaultNow(),
+    lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    chainAddressIpUniq: uniqueIndex("validator_location_ips_key_idx").on(t.chainId, t.validatorAddress, t.ip),
+    byChain: index("validator_location_ips_chain_idx").on(t.chainId),
+  }),
+);
+
+/** One row per indexed block. Composite PK (chain_id, height). */
+export const blocks = pgTable(
+  "blocks",
+  {
+    chainId: integer("chain_id")
+      .notNull()
+      .references(() => chains.id, { onDelete: "cascade" }),
+    height: integer("height").notNull(),
+    hash: text("hash"),
+    time: timestamp("time", { withTimezone: true }).notNull(),
+    proposerAddress: text("proposer_address"),
+    validatorCount: integer("validator_count"),
+    signatureCount: integer("signature_count"),
+    /**
+     * Consensus round that finalized this block (0 = first round). Stored one
+     * ingest late — a block's round is only known from the NEXT block's
+     * last_commit — so the newest block is null until its successor lands.
+     * >0 means the chain needed extra rounds: a slow or absent proposer.
+     */
+    round: integer("round"),
+    txCount: integer("tx_count"),
+    ingestedAt: timestamp("ingested_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.chainId, t.height] }),
+    byChainHeight: index("blocks_chain_height_idx").on(t.chainId, t.height),
+    byChainTime: index("blocks_chain_time_idx").on(t.chainId, t.time),
+  }),
+);
+
+/**
+ * One row per (validator, block): whether the validator signed that block's
+ * commit. Drives uptime %, missed-streak, and the per-validator signing
+ * heatmap. No FK on purpose (hot insert path); indexed for validator-centric
+ * access patterns.
+ */
+export const blockSignatures = pgTable(
+  "block_signatures",
+  {
+    chainId: integer("chain_id").notNull(),
+    height: integer("height").notNull(),
+    validatorAddress: text("validator_address").notNull(),
+    signed: boolean("signed").notNull(),
+    time: timestamp("time", { withTimezone: true }).notNull(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.chainId, t.height, t.validatorAddress] }),
+    byValidatorHeight: index("block_sigs_validator_height_idx").on(
+      t.validatorAddress,
+      t.chainId,
+      t.height,
+    ),
+    byChainHeight: index("block_sigs_chain_height_idx").on(t.chainId, t.height),
+  }),
+);
+
+/**
+ * Per-validator daily signing counts, rolled up from block_signatures by the
+ * retention sweep. Raw per-block signatures are kept for the long uptime
+ * window plus a margin; anything older is folded into this table and deleted,
+ * so history is bounded in storage without being lost.
+ */
+export const validatorSigningDaily = pgTable(
+  "validator_signing_daily",
+  {
+    chainId: integer("chain_id").notNull(),
+    day: timestamp("day", { withTimezone: true }).notNull(), // UTC date_trunc('day', block time)
+    validatorAddress: text("validator_address").notNull(),
+    slots: integer("slots").notNull(),
+    signed: integer("signed").notNull(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.chainId, t.day, t.validatorAddress] }),
+  }),
+);
+
+/**
+ * Retention bookkeeping: the newest height whose block_signatures have been
+ * rolled into validator_signing_daily (and deleted). Ranges are aggregated at
+ * most once, so a sweep that re-runs can never double-count.
+ */
+export const signatureRetention = pgTable("signature_retention", {
+  chainId: integer("chain_id")
+    .primaryKey()
+    .references(() => chains.id, { onDelete: "cascade" }),
+  lastHeight: integer("last_height").notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** Validator-set membership transitions (added/removed), polled periodically. */
+export const validatorSetChanges = pgTable(
+  "validator_set_changes",
+  {
+    id: serial("id").primaryKey(),
+    chainId: integer("chain_id")
+      .notNull()
+      .references(() => chains.id, { onDelete: "cascade" }),
+    height: integer("height").notNull(),
+    validatorAddress: text("validator_address").notNull(),
+    changeType: text("change_type").notNull(), // "added" | "removed"
+    votingPowerBefore: integer("voting_power_before"),
+    votingPowerAfter: integer("voting_power_after"),
+    time: timestamp("time", { withTimezone: true }).notNull(),
+  },
+  (t) => ({
+    byChainHeight: index("vsc_chain_height_idx").on(t.chainId, t.height),
+  }),
+);
