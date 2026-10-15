@@ -1,0 +1,30 @@
+[Unit]
+Description=Sealed API + dashboard
+Documentation=https://github.com/r0bops/secretnetwork-explorer
+# Postgres runs locally; wait for it but don't hard-require it — the API
+# re-resolves its chain every 30s and recovers on its own.
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/secretnetwork-explorer
+EnvironmentFile=/root/secretnetwork-explorer/.env
+# Node and pnpm come from nvm on this host; adjust if Node is installed elsewhere.
+Environment=PATH=/root/.nvm/versions/node/v24.21.0/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/root/.nvm/versions/node/v24.21.0/bin/pnpm --filter @sealed/api start
+Restart=always
+RestartSec=5
+# Keep retrying rather than hitting the default start-limit and giving up.
+StartLimitIntervalSec=0
+# Hardening: the API needs no privileges and no writable filesystem.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sealed-api
+
+[Install]
+WantedBy=multi-user.target

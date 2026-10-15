@@ -1,0 +1,28 @@
+# Public facade for the Sealed dashboard. Install with:
+#   sudo cp deploy/Caddyfile /etc/caddy/Caddyfile && sudo systemctl reload caddy
+# Caddy obtains and renews the TLS certificate itself (ports 80 and 443 must
+# be reachable). The API stays bound to 127.0.0.1:3000; PUBLIC_HOST in .env
+# must match this hostname so endpoint URLs are redacted for visitors.
+
+secretnetwork.explorer.pathrocknetwork.org {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+
+	# The public site is read-only: label/watch/pin PATCHes are operator
+	# actions and must go through loopback or the tailnet, never the internet.
+	@write not method GET HEAD OPTIONS
+	respond @write "read-only" 405
+
+	reverse_proxy 127.0.0.1:3000
+
+	log {
+		output file /var/log/caddy/sealed.access.log {
+			roll_size 50MiB
+			roll_keep 5
+		}
+	}
+}

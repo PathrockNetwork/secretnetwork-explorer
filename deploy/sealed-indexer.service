@@ -1,0 +1,29 @@
+[Unit]
+Description=Sealed CometBFT indexer
+Documentation=https://github.com/r0bops/secretnetwork-explorer
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/secretnetwork-explorer
+EnvironmentFile=/root/secretnetwork-explorer/.env
+# Node and pnpm come from nvm on this host; adjust if Node is installed elsewhere.
+Environment=PATH=/root/.nvm/versions/node/v24.21.0/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/root/.nvm/versions/node/v24.21.0/bin/pnpm --filter @sealed/adapter-cometbft start
+Restart=always
+RestartSec=10
+# A restart re-runs backfill and the gap scanner, so any blocks missed while
+# the service was down are repaired rather than left as permanent holes.
+StartLimitIntervalSec=0
+# Hardening: the indexer needs no privileges and no writable filesystem.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sealed-indexer
+
+[Install]
+WantedBy=multi-user.target
