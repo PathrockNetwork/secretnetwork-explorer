@@ -10,6 +10,7 @@ import fastifyStatic from "@fastify/static";
 import { createDb, loadEnv } from "@sealed/core";
 import { ChainHead } from "./chain-head.js";
 import { getChain, registerRoutes, type Deps } from "./routes.js";
+import { Yaci } from "./yaci.js";
 import type { ChainRow } from "./queries.js";
 
 loadEnv();
@@ -58,7 +59,16 @@ await refreshChain();
 // Placeholder head until a chain resolves, so routes never dereference null.
 head ??= new ChainHead("");
 
-const deps: Deps = { pool, head: () => head!, chain: () => chainRow };
+// Optional yaci index: transactions, paging and address history come from it,
+// with the LCD as fallback (see routes.ts).
+const yaci = process.env.YACI_DATABASE_URL
+  ? new Yaci(process.env.YACI_DATABASE_URL, () => chainRow?.meta?.bech32Prefix ?? "secret")
+  : null;
+
+// Optional deeper-history LCDs (comma-separated), asked only for an address's
+// txs or a hash older than every block the main node and yaci hold.
+const historyLcdUrls = (process.env.SECRET_LCD_HISTORY_URLS ?? "").split(",").map((u) => u.trim()).filter(Boolean);
+const deps: Deps = { pool, head: () => head!, chain: () => chainRow, yaci, historyLcdUrls };
 
 /**
  * Security headers and cache policy, applied before any route is registered
@@ -134,7 +144,7 @@ const shutdown = async (sig: string) => {
   try {
     await fastify.close();
   } finally {
-    await pool.end();
+    await Promise.allSettled([pool.end(), yaci?.close()]);
     process.exit(0);
   }
 };

@@ -3,6 +3,7 @@ Description=Sealed CometBFT indexer
 Documentation=https://github.com/r0bops/secretnetwork-explorer
 After=network-online.target postgresql.service
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -15,7 +16,7 @@ Restart=always
 RestartSec=10
 # A restart re-runs backfill and the gap scanner, so any blocks missed while
 # the service was down are repaired rather than left as permanent holes.
-StartLimitIntervalSec=0
+
 # Hardening: the indexer needs no privileges and no writable filesystem.
 NoNewPrivileges=true
 ProtectSystem=strict

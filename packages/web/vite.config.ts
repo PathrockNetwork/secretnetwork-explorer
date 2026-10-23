@@ -8,6 +8,11 @@ const target = `http://${process.env.API_HOST ?? "127.0.0.1"}:${process.env.API_
 
 export default defineConfig({
   plugins: [react()],
+  build: {
+    // The API's CSP allows fonts from 'self' only, so tiny font subsets must
+    // ship as files rather than being inlined as data: URIs.
+    assetsInlineLimit: (file) => (/\.(woff2?|ttf|otf)$/.test(file) ? false : undefined),
+  },
   server: {
     proxy: {
       "/api": target,

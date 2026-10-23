@@ -1,0 +1,26 @@
+[Unit]
+Description=yaci history backfill (runs until the node's pruning horizon)
+Documentation=https://github.com/manifest-network/yaci
+After=network-online.target postgresql.service sealed-yaci.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/root/secretnetwork-explorer
+EnvironmentFile=/root/secretnetwork-explorer/.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/root/secretnetwork-explorer/deploy/yaci/backfill.sh
+# Retry failed chunks; a clean exit means history is complete.
+Restart=on-failure
+RestartSec=60
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sealed-yaci-backfill
+
+[Install]
+WantedBy=multi-user.target

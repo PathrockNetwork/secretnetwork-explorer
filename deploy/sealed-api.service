@@ -5,6 +5,8 @@ Documentation=https://github.com/r0bops/secretnetwork-explorer
 # re-resolves its chain every 30s and recovers on its own.
 After=network-online.target postgresql.service
 Wants=network-online.target
+# Keep retrying rather than hitting the default start-limit and giving up.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -15,8 +17,6 @@ Environment=PATH=/root/.nvm/versions/node/v24.21.0/bin:/usr/local/bin:/usr/bin:/
 ExecStart=/root/.nvm/versions/node/v24.21.0/bin/pnpm --filter @sealed/api start
 Restart=always
 RestartSec=5
-# Keep retrying rather than hitting the default start-limit and giving up.
-StartLimitIntervalSec=0
 # Hardening: the API needs no privileges and no writable filesystem.
 NoNewPrivileges=true
 ProtectSystem=strict

@@ -1,0 +1,28 @@
+[Unit]
+Description=yaci transaction indexer (follows new blocks)
+Documentation=https://github.com/manifest-network/yaci
+After=network-online.target postgresql.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/root/secretnetwork-explorer
+EnvironmentFile=/root/secretnetwork-explorer/.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# No -s: yaci resumes after the newest stored block and first repairs any
+# gaps inside the stored range. Concurrency stays low for the gRPC gateway's
+# rate limit (20 parallel requests drew 429s; 3 never did).
+ExecStart=/root/secretnetwork-explorer/deploy/yaci/yaci-run.sh --live -c 2 -r 10 -t 6
+Restart=always
+RestartSec=15
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sealed-yaci
+
+[Install]
+WantedBy=multi-user.target

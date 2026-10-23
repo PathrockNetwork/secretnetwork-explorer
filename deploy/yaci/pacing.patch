@@ -1,0 +1,35 @@
+diff --git a/internal/client/client.go b/internal/client/client.go
+index 95425fc..a387b84 100644
+--- a/internal/client/client.go
++++ b/internal/client/client.go
+@@ -31,7 +31,7 @@ func NewGRPCClient(ctx context.Context, address string, insecure bool, maxCallRe
+ 	conn := dial(ctx, address, insecure, maxCallRecvMsgSize)
+ 
+ 	slog.Info("Fetching protocol buffer descriptors from gRPC server... This may take a while.")
+-	descriptors, err := reflection.FetchAllDescriptors(ctx, conn, 3)
++	descriptors, err := reflection.FetchAllDescriptors(ctx, conn, 10)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to fetch descriptors: %w", err)
+ 	}
+@@ -42,7 +42,7 @@ func NewGRPCClient(ctx context.Context, address string, insecure bool, maxCallRe
+ 		return nil, fmt.Errorf("failed to build descriptor set: %w", err)
+ 	}
+ 
+-	resolver := reflection.NewCustomResolver(ctx, files, conn, 3)
++	resolver := reflection.NewCustomResolver(ctx, files, conn, 10)
+ 
+ 	return &GRPCClient{
+ 		Ctx:      ctx,
+diff --git a/internal/reflection/fetch_descriptor.go b/internal/reflection/fetch_descriptor.go
+index 7bc2227..537f590 100644
+--- a/internal/reflection/fetch_descriptor.go
++++ b/internal/reflection/fetch_descriptor.go
+@@ -154,6 +154,8 @@ func sendReflectionRequestWithRetry(ctx context.Context, grpcClient *grpc.Client
+ 	var resp *reflection.ServerReflectionResponse
+ 	var err error
+ 	for attempt := uint(1); attempt <= maxRetries; attempt++ {
++		// Pace reflection requests: public endpoints behind Cloudflare 429 a burst.
++		time.Sleep(250 * time.Millisecond)
+ 		resp, err = sendReflectionRequest(ctx, grpcClient, req)
+ 		if err == nil {
+ 			return resp, nil

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Transaction } from "../src/api";
-import { filterTransactions, nativeFees, transactionCategory, type TransactionFilters } from "../src/transactionExplorer";
+import { addressFromHash, addressRoute, filterTransactions, nativeFees, searchTarget, transactionCategory, type TransactionFilters } from "../src/transactionExplorer";
 const now = Date.parse("2026-10-14T12:00:00Z");
 const tx = (override: Partial<Transaction> = {}): Transaction => ({ hash: "A".repeat(64), height: 123, timestamp: new Date(now - 1000).toISOString(), ok: true, code: 0, codespace: null, gas_used: 100, gas_wanted: 200, fee: [{ amount: "1000", denom: "uscrt" }], memo: "test memo", signer: "secret1sender", type: "Send", message_count: 1, encrypted: false, contract: null, contract_label: null, ...override });
 const filters: TransactionFilters = { query: "", category: "All", status: "all", privacy: "all", contract: "all", hours: 0 };
@@ -24,5 +24,22 @@ describe("transaction explorer", () => {
     const denom = { base: "uscrt", display: "SCRT", exponent: 6 };
     expect(nativeFees([tx(), tx({ fee: [{ amount: "2000000", denom: "uatom" }] }), tx({ fee: [] }), tx({ fee: [{ amount: "0", denom: "uscrt" }] }), tx({ fee: [{ amount: "NaN", denom: "uscrt" }] }), tx({ fee: [{ amount: "999999999999999999999", denom: "uscrt" }] })], denom)).toEqual([.001, 0]);
     expect(nativeFees([tx()], null)).toEqual([]);
+  });
+});
+
+describe("global search intent", () => {
+  const ADDRESS = "secret1p55wr2n6f63wyap8g9dckkxmf4wvq73ensxrw4";
+  it("recognises hashes, addresses, heights and names", () => {
+    expect(searchTarget(` ${"ab".repeat(32)} `)).toEqual({ kind: "transaction", hash: "AB".repeat(32) });
+    expect(searchTarget(ADDRESS.toUpperCase())).toEqual({ kind: "address", address: ADDRESS });
+    expect(searchTarget("27630042")).toEqual({ kind: "block", height: 27630042 });
+    expect(searchTarget("secretvaloper1wg085tj9xtv84q9l2zgdml46n6ju3mryun4fsu")).toEqual({ kind: "text", query: "secretvaloper1wg085tj9xtv84q9l2zgdml46n6ju3mryun4fsu" });
+    expect(searchTarget("Kraken")).toEqual({ kind: "text", query: "Kraken" });
+    expect(searchTarget("0")).toEqual({ kind: "text", query: "0" });
+    expect(searchTarget("   ")).toBeNull();
+  });
+  it("round-trips the address route", () => {
+    expect(addressFromHash(addressRoute(ADDRESS))).toBe(ADDRESS);
+    expect(addressFromHash("#/transactions/ABCD")).toBeNull();
   });
 });

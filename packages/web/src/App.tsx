@@ -13,6 +13,7 @@ import { DirectRpc } from "./pages/DirectRpc";
 import { RpcDirectory } from "./pages/RpcDirectory";
 import { Blocks } from "./pages/Blocks";
 import { Transactions } from "./pages/Transactions";
+import { addressRoute, searchTarget } from "./transactionExplorer";
 import { Governance } from "./pages/Governance";
 import { OK, TX, TX2, sans } from "./components/ui";
 import { EndpointSwitcher } from "./components/EndpointSwitcher";
@@ -233,8 +234,13 @@ export default function App() {
               className={`global-search${mobileSearchOpen ? " mobile-search-open" : ""}`}
               onSubmit={(e) => {
                 e.preventDefault();
-                const q = search.trim().toLowerCase();
-                if (!q) return;
+                const target = searchTarget(search, d.net?.chain.bech32_prefix ?? "secret");
+                if (!target) return;
+                setMobileSearchOpen(false);
+                if (target.kind === "transaction") { window.location.hash = `/transactions/${target.hash}`; return; }
+                if (target.kind === "address") { window.location.hash = addressRoute(target.address).slice(1); return; }
+                if (target.kind === "block") { window.location.hash = `/blocks/${target.height}`; return; }
+                const q = target.query.toLowerCase();
                 const match = d.validators.find((v) =>
                   v.address.toLowerCase().includes(q) ||
                   v.moniker?.toLowerCase().includes(q) ||

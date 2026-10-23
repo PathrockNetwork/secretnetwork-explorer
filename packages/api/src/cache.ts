@@ -61,6 +61,8 @@ export class CacheMap<T> {
   constructor(
     private readonly load: (key: string) => Promise<T>,
     private readonly ttlMs: number,
+    /** Oldest keys are dropped past this, so public per-address lookups cannot grow it without bound. */
+    private readonly maxEntries = 5_000,
   ) {}
 
   get(key: string | number): Promise<T> {
@@ -69,6 +71,7 @@ export class CacheMap<T> {
     if (!entry) {
       entry = new Cached(() => this.load(k), this.ttlMs);
       this.entries.set(k, entry);
+      if (this.entries.size > this.maxEntries) this.entries.delete(this.entries.keys().next().value!);
     }
     return entry.get();
   }

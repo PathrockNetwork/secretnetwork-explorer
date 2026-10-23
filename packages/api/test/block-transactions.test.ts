@@ -23,7 +23,7 @@ describe("block transactions route", () => {
     const server = app();
     const first = await server.inject('/api/v1/blocks/42/transactions');
     expect(first.statusCode).toBe(200);
-    expect(first.json()).toEqual({ transactions: [], limit: 100 });
+    expect(first.json()).toEqual({ transactions: [], limit: 100, source: "lcd" });
     expect(String(fetch.mock.calls[0][0])).toContain('query=tx.height%3D42');
     await server.inject('/api/v1/blocks/42/transactions');
     expect(fetch).toHaveBeenCalledTimes(1);

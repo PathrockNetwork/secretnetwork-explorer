@@ -308,8 +308,34 @@ export type TransactionDetail = Transaction & {
   events: TxEvent[];
   raw_log: string | null;
 };
-export const getTransactions = (limit: number = 25) =>
-  get<{ transactions: Transaction[] }>(`/api/v1/transactions?limit=${limit}`);
+export type TransactionPage = {
+  transactions: Transaction[];
+  /** "yaci" when served from the transaction index, "lcd" for the live fallback, "yaci+lcd" when an address's older txs came from the node while the index backfills. */
+  source?: "yaci" | "lcd" | "yaci+lcd";
+  /** Block range the index holds; null on the LCD fallback. */
+  index?: { earliest: number; latest: number } | null;
+  /** Pass as `before` for the next older page; null when there is none. */
+  next_before?: number | null;
+};
+export const getTransactions = (limit: number = 25, opts: { before?: number; address?: string } = {}) => {
+  const q = new URLSearchParams({ limit: String(limit) });
+  if (opts.before) q.set("before", String(opts.before));
+  if (opts.address) q.set("address", opts.address);
+  return get<TransactionPage>(`/api/v1/transactions?${q}`);
+};
+export type AccountFunds = {
+  address: string;
+  account_type: string | null;
+  account_number: number | null;
+  sequence: number | null;
+  balances: Coin[];
+  delegations: { validator: string; moniker: string | null; amount: Coin }[];
+  rewards: { validator: string; amount: Coin[] }[];
+  rewards_total: Coin[];
+  unbonding: { validator: string; moniker: string | null; amount: string; completion_time: string | null }[];
+  contract: { label: string | null; code_id: number | null; admin: string | null } | null;
+};
+export const getAccount = (address: string) => get<AccountFunds>(`/api/v1/accounts/${address}`);
 export const getBlockTransactions = (height: number) =>
   get<{ transactions: Transaction[]; limit: number }>(`/api/v1/blocks/${height}/transactions`);
 export const getTransaction = (hash: string) =>

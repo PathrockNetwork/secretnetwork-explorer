@@ -49,6 +49,29 @@ sudo systemctl enable --now sealed-indexer sealed-api
 ```
 The units expect Node/pnpm from nvm (`Environment=PATH=…`); adjust the path if Node lives elsewhere.
 
+## Transaction index (yaci)
+[yaci](https://github.com/manifest-network/yaci) indexes every transaction over gRPC into its own
+database (`sealed_yaci`). With `YACI_DATABASE_URL` set, the API serves the transaction feed, block
+transactions, lookups by hash, paging (`before`) and address history (`address`) from it, and falls
+back to the LCD while yaci is catching up or for anything it has not indexed. The gRPC endpoint
+(`YACI_GRPC`) must have server reflection enabled.
+
+```bash
+# Build yaci with the request pacing patch (public gRPC gateways 429 a burst of reflection calls)
+git clone https://github.com/manifest-network/yaci && cd yaci && git checkout d086ce6
+git apply ../secretnetwork-explorer/deploy/yaci/pacing.patch && go build -o /usr/local/bin/yaci .
+# Database, indexes and services
+sudo -u postgres psql -c "create role web_anon nologin" -c "create database sealed_yaci owner sealed"
+sudo cp deploy/sealed-yaci*.service /etc/systemd/system/ && sudo systemctl daemon-reload
+sudo systemctl enable --now sealed-yaci                    # follows new blocks
+psql "$YACI_DATABASE_URL" -f deploy/yaci/indexes.sql      # after yaci's first migration
+sudo systemctl enable --now sealed-yaci-backfill           # walks history back to the node's pruning horizon
+```
+Concurrency is kept low (2 live, 3 backfill): 20 parallel requests drew 429s from the gateway; 3 never
+did, at ~10 blocks/s. Over gRPC, Secret compute messages carry `sender`/`contract` as raw bytes;
+`packages/api/src/yaci.ts` converts them to bech32, and address search matches both forms. A full
+backfill of ~1M blocks takes roughly a day and ~13 GB.
+
 ## Public site
 Live at https://secretnetwork.explorer.pathrocknetwork.org. Caddy terminates TLS
 (Let's Encrypt, auto-renewed) and proxies to the API on 127.0.0.1:3000:
@@ -65,8 +88,13 @@ label, watch and pin edits only work over loopback (`http://127.0.0.1:3000`).
 - `GET /api/v1/validators` · `GET /api/v1/validators/:address?window=N` — signing metrics plus
   the x/staking view (operator, tokens, commission, bond status, jailed, missed counter)
 - `GET /api/v1/validator-set` · `/metrics` · `/series` · `/endpoints` · `/rpc-directory` · `/config`
-- `GET /api/v1/transactions` · `GET /api/v1/transactions/:hash` — LCD read-through; compute
-  ciphertext is returned as `{ sealed: true, bytes }`
+- `GET /api/v1/transactions?limit&before&address` · `GET /api/v1/transactions/:hash` — from the
+  yaci index (LCD fallback); `before` pages by height, `address` returns an account's or contract's
+  history; compute ciphertext is returned as `{ sealed: true, bytes }`
+  Below the oldest block yaci holds, an address's history comes from the node's tx index, then from
+  `SECRET_LCD_HISTORY_URLS` (optional, deeper-retention LCDs) below that; hash lookups fall back to them too.
+- `GET /api/v1/accounts/:address` — an account's or contract's public funds via the LCD:
+  bank balances, delegations (with validator monikers), unclaimed rewards, unbonding.
 - `GET /api/v1/governance` — newest proposals with live tallies and tally params
 - `GET /api/v1/staking` — bonded pool, slashing params (jail threshold) and the next upgrade
 - `GET /api/v1/market` — SCRT/USD (CoinGecko, cached)

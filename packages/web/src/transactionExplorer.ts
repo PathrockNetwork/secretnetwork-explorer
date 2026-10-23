@@ -38,3 +38,32 @@ export function nativeFees(rows: Transaction[], denom: Denom | null): number[] {
     return Number.isSafeInteger(total) ? [total / 10 ** denom.exponent] : [];
   });
 }
+
+/** What the global search box was given, decided from its shape alone. */
+export type SearchTarget =
+  | { kind: "transaction"; hash: string }
+  | { kind: "address"; address: string }
+  | { kind: "block"; height: number }
+  | { kind: "text"; query: string };
+
+/**
+ * A 64-hex string is a tx hash, `<prefix>1…` an account or contract address
+ * (operator `<prefix>valoper1…` addresses stay validator searches), a bare
+ * number a block height; anything else is a validator name search.
+ */
+export function searchTarget(input: string, prefix = "secret"): SearchTarget | null {
+  const q = input.trim();
+  if (!q) return null;
+  if (/^[0-9a-f]{64}$/i.test(q)) return { kind: "transaction", hash: q.toUpperCase() };
+  const lower = q.toLowerCase();
+  if (lower.startsWith(`${prefix}1`) && /^[a-z0-9]+1[02-9ac-hj-np-z]{38,58}$/.test(lower)) return { kind: "address", address: lower };
+  if (/^\d{1,15}$/.test(q) && Number(q) > 0) return { kind: "block", height: Number(q) };
+  return { kind: "text", query: q };
+}
+
+export const addressRoute = (address: string) => `#/transactions/address/${address}`;
+
+/** `#/transactions/address/<addr>` → addr, else null. */
+export function addressFromHash(hash: string): string | null {
+  return hash.match(/^#\/transactions\/address\/([a-z0-9]+1[02-9ac-hj-np-z]+)$/)?.[1] ?? null;
+}

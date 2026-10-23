@@ -61,7 +61,7 @@ export class LcdNotFound extends Error {
 
 type Coin = { denom: string; amount: string };
 
-type RawTxResponse = {
+export type RawTxResponse = {
   txhash?: string;
   height?: string;
   code?: number;
@@ -131,6 +131,11 @@ export function typeLabel(t: string | null): string {
 function decodedLength(b64: string): number {
   const pad = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
   return Math.floor((b64.length * 3) / 4) - pad;
+}
+
+/** Tx response `data` is hex from the SDK 0.50 LCD and gRPC; older fixtures use base64. */
+function dataLength(data: string): number {
+  return data.length % 2 === 0 && /^[0-9A-F]+$/i.test(data) ? data.length / 2 : decodedLength(data);
 }
 
 export type SealedField = { sealed: true; bytes: number };
@@ -241,7 +246,7 @@ export function detailTx(r: RawTxResponse): TxDetail | null {
   return {
     ...summary,
     messages,
-    data: data && summary.encrypted ? { sealed: true, bytes: decodedLength(data) } : data,
+    data: data && summary.encrypted ? { sealed: true, bytes: dataLength(data) } : data,
     events,
     // A failed tx's log is the only explanation the chain gives; keep it short.
     raw_log: summary.ok ? null : (text(r.raw_log)?.slice(0, 2_000) ?? null),
@@ -253,6 +258,38 @@ export async function txsAtHeight(lcd: Lcd, height: number): Promise<TxSummary[]
   const q = new URLSearchParams({ query: `tx.height=${height}`, "pagination.limit": "100" });
   const j = await lcd.get<{ tx_responses?: RawTxResponse[] }>(`/cosmos/tx/v1beta1/txs?${q}`);
   return (j.tx_responses ?? []).map(summarizeTx).filter((t): t is TxSummary => t !== null).reverse();
+}
+
+/**
+ * An address's txs below `ceiling` (exclusive), newest first, from the node's
+ * tx index: as a message sender, a transfer recipient, or a called contract.
+ * Covers history the yaci index has not backfilled yet; the node only answers
+ * for blocks it still retains.
+ */
+export async function txsForAddress(lcd: Lcd, address: string, ceiling: number, limit: number): Promise<TxSummary[]> {
+  const queries = [`message.sender='${address}'`, `transfer.recipient='${address}'`, `wasm.contract_address='${address}'`];
+  const pages = await Promise.all(
+    queries.map(async (q) => {
+      const params = new URLSearchParams({
+        query: `${q} AND tx.height<${ceiling}`,
+        order_by: "ORDER_BY_DESC",
+        "pagination.limit": String(limit),
+      });
+      try {
+        const j = await lcd.get<{ tx_responses?: RawTxResponse[] }>(`/cosmos/tx/v1beta1/txs?${params}`, 20_000);
+        return j.tx_responses ?? [];
+      } catch (e) {
+        if (e instanceof LcdNotFound) return [];
+        throw e;
+      }
+    }),
+  );
+  const byHash = new Map<string, TxSummary>();
+  for (const r of pages.flat()) {
+    const t = summarizeTx(r);
+    if (t) byHash.set(t.hash, t);
+  }
+  return [...byHash.values()].sort((a, b) => (b.height ?? 0) - (a.height ?? 0)).slice(0, limit);
 }
 
 export async function txByHash(lcd: Lcd, hash: string): Promise<TxDetail | null> {
@@ -441,4 +478,95 @@ export async function slashingParams(lcd: Lcd): Promise<SlashingParams> {
     slash_fraction_downtime: dec(p.slash_fraction_downtime),
     slash_fraction_double_sign: dec(p.slash_fraction_double_sign),
   };
+}
+
+// ── Accounts ─────────────────────────────────────────────────────────────────
+
+export type AccountFunds = {
+  /** Base-account type ("BaseAccount", "ContinuousVestingAccount", …); null for a never-used address. */
+  account_type: string | null;
+  account_number: number | null;
+  sequence: number | null;
+  balances: Coin[];
+  delegations: { validator: string; amount: Coin }[];
+  /** Unclaimed staking rewards, truncated to whole base units. */
+  rewards: { validator: string; amount: Coin[] }[];
+  rewards_total: Coin[];
+  unbonding: { validator: string; amount: string; completion_time: string | null }[];
+};
+
+/** Decimal coin amounts (distribution rewards) → whole base units. */
+const whole = (c: { denom?: string; amount?: string }): Coin => ({
+  denom: c.denom ?? "",
+  amount: (c.amount ?? "0").split(".")[0] || "0",
+});
+
+/**
+ * An address's funds from the LCD: liquid balances, delegations, unclaimed
+ * rewards and unbonding entries. Bank and staking balances are public on
+ * Secret; SNIP-20 token balances are private to viewing keys and not shown.
+ */
+export async function accountFunds(lcd: Lcd, address: string): Promise<AccountFunds> {
+  const orEmpty = <T>(p: Promise<T>, empty: T) => p.catch((e) => (e instanceof LcdNotFound ? empty : Promise.reject(e)));
+  const [account, bank, delegations, rewards, unbonding] = await Promise.all([
+    orEmpty(lcd.get<{ account?: Record<string, unknown> }>(`/cosmos/auth/v1beta1/accounts/${address}`), {}),
+    lcd.get<{ balances?: Coin[] }>(`/cosmos/bank/v1beta1/balances/${address}?pagination.limit=200`),
+    orEmpty(
+      lcd.get<{ delegation_responses?: { delegation?: { validator_address?: string }; balance?: Coin }[] }>(
+        `/cosmos/staking/v1beta1/delegations/${address}?pagination.limit=200`,
+      ),
+      {},
+    ),
+    orEmpty(
+      lcd.get<{ rewards?: { validator_address?: string; reward?: Coin[] }[]; total?: Coin[] }>(
+        `/cosmos/distribution/v1beta1/delegators/${address}/rewards`,
+      ),
+      {},
+    ),
+    orEmpty(
+      lcd.get<{ unbonding_responses?: { validator_address?: string; entries?: { balance?: string; completion_time?: string }[] }[] }>(
+        `/cosmos/staking/v1beta1/delegators/${address}/unbonding_delegations?pagination.limit=200`,
+      ),
+      {},
+    ),
+  ]);
+  // Vesting and module accounts nest the base account one level down.
+  const acct = account.account ?? {};
+  const base = (acct.base_vesting_account as { base_account?: Record<string, unknown> } | undefined)?.base_account
+    ?? (acct.base_account as Record<string, unknown> | undefined)
+    ?? acct;
+  const num = (v: unknown) => (typeof v === "string" && /^\d+$/.test(v) ? Number(v) : null);
+  return {
+    account_type: typeof acct["@type"] === "string" ? (acct["@type"] as string).split(".").pop()! : null,
+    account_number: num(base.account_number),
+    sequence: num(base.sequence),
+    balances: (bank.balances ?? []).map(whole),
+    delegations: (delegations.delegation_responses ?? [])
+      .filter((d) => d.delegation?.validator_address && d.balance)
+      .map((d) => ({ validator: d.delegation!.validator_address!, amount: whole(d.balance!) })),
+    rewards: (rewards.rewards ?? [])
+      .filter((r) => r.validator_address)
+      .map((r) => ({ validator: r.validator_address!, amount: (r.reward ?? []).map(whole) })),
+    rewards_total: (rewards.total ?? []).map(whole),
+    unbonding: (unbonding.unbonding_responses ?? []).flatMap((u) =>
+      (u.entries ?? []).map((e) => ({
+        validator: u.validator_address ?? "",
+        amount: (e.balance ?? "0").split(".")[0] || "0",
+        completion_time: e.completion_time ?? null,
+      })),
+    ),
+  };
+}
+
+/** Operator address → moniker, or null when the LCD does not know it. */
+export async function validatorMoniker(lcd: Lcd, operator: string): Promise<string | null> {
+  try {
+    const j = await lcd.get<{ validator?: { description?: { moniker?: string } } }>(
+      `/cosmos/staking/v1beta1/validators/${operator}`,
+    );
+    return text(j.validator?.description?.moniker);
+  } catch (e) {
+    if (e instanceof LcdNotFound) return null;
+    throw e;
+  }
 }

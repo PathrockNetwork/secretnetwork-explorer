@@ -6,6 +6,7 @@
  */
 import type { FastifyError, FastifyInstance } from "fastify";
 import type pg from "pg";
+import { bech32Decode } from "@sealed/core";
 import type { ChainHead } from "./chain-head.js";
 import {
   LONG_WINDOW,
@@ -31,20 +32,34 @@ import {
   type ValidatorRow,
 } from "./queries.js";
 import { Cached, CacheMap } from "./cache.js";
+import type { Yaci } from "./yaci.js";
 import { createAvatarResolver, withAvatars } from "./avatars.js";
 import {
   Lcd,
   LcdNotFound,
+  accountFunds,
   contractInfo,
+  validatorMoniker,
   govParams,
   proposals,
   slashingParams,
   stakingPool,
   txByHash,
+  txsForAddress,
   txsAtHeight,
   upgradePlan,
   type TxSummary,
 } from "./lcd.js";
+
+/** True for a bech32 account (20-byte) or contract (32-byte) address under `prefix`. */
+function isAccountAddress(address: string, prefix: string): boolean {
+  try {
+    const { hrp, data } = bech32Decode(address);
+    return hrp === prefix && (data.length === 20 || data.length === 32);
+  } catch {
+    return false;
+  }
+}
 
 /** Lag beyond which the indexer is considered stalled rather than merely behind. */
 const STALL_LAG_BLOCKS = 50;
@@ -91,6 +106,10 @@ export type Deps = {
   head: () => ChainHead;
   /** Resolved once at boot; null when the indexer has never seeded a chain row. */
   chain: () => ChainRow | null;
+  /** yaci transaction index; null when YACI_DATABASE_URL is unset (LCD only). */
+  yaci?: Yaci | null;
+  /** LCDs retaining more history than the main node; queried only below its floor. */
+  historyLcdUrls?: string[];
 };
 
 type ValidatorView = {
@@ -230,6 +249,7 @@ export function registerRoutes(app: FastifyInstance, deps: Deps): void {
   const resolveAvatar = createAvatarResolver();
   /** LCD reads (txs, governance, staking) follow the chain's configured URLs. */
   const lcd = new Lcd(() => deps.chain()?.meta?.lcdUrls ?? []);
+  const historyLcd = new Lcd(() => deps.historyLcdUrls ?? []);
 
   /**
    * Same-origin avatar proxy: the dashboard's <img> tags point here instead
@@ -537,6 +557,28 @@ export function registerRoutes(app: FastifyInstance, deps: Deps): void {
    * messages are reported as sealed (see lcd.ts) — never decoded.
    */
   const TX_BLOCKS_SCANNED = 12;
+  /** yaci within this many blocks of the indexer's tip counts as live. */
+  const YACI_FRESH_BLOCKS = 20;
+  /**
+   * An address's txs below `ceiling`: the main node first, then any deeper
+   * history LCD below the oldest height found so far. Overlap is harmless —
+   * rows are deduplicated by hash.
+   */
+  const olderForAddress = new CacheMap(async (key: string) => {
+    const [addr, ceiling, n] = key.split(":");
+    const limit = Number(n);
+    const rows = await txsForAddress(lcd, addr!, Number(ceiling), limit);
+    if (rows.length >= limit || !historyLcd.configured) return rows;
+    const floor = rows.length ? rows[rows.length - 1]!.height ?? Number(ceiling) : Number(ceiling);
+    const deeper = await txsForAddress(historyLcd, addr!, floor, limit).catch((e) => {
+      app.log.warn({ err: e }, "history LCD unavailable");
+      return [];
+    });
+    const seen = new Set(rows.map((r) => r.hash));
+    return [...rows, ...deeper.filter((r) => !seen.has(r.hash))].slice(0, limit);
+    // Everything here is below yaci's floor, so it never changes; the TTL only
+    // spares the deep LCD (seconds per query, rate-limited) repeat lookups.
+  }, 10 * 60_000);
   const txsAt = new CacheMap((h: string) => txsAtHeight(lcd, Number(h)), 10 * 60_000);
   const labels = new CacheMap((addr: string) => contractInfo(lcd, addr), 60 * 60_000);
   const withLabels = async <T extends { contract: string | null }>(rows: T[]) =>
@@ -555,7 +597,11 @@ export function registerRoutes(app: FastifyInstance, deps: Deps): void {
       return { error: "height must be a positive integer" };
     }
     try {
-      return { transactions: await withLabels(await txsAt.get(String(height))), limit: 100 };
+      // yaci is authoritative for heights it holds (an empty block stays empty);
+      // anything older or not reached yet goes through the LCD.
+      const indexed = deps.yaci ? await deps.yaci.hasBlock(height).catch(() => false) : false;
+      const rows = indexed ? await deps.yaci!.atHeight(height) : await txsAt.get(String(height));
+      return { transactions: await withLabels(rows), limit: 100, source: indexed ? "yaci" : "lcd" };
     } catch (e) {
       app.log.warn({ err: e, height }, "block transactions unavailable");
       reply.code(503);
@@ -563,15 +609,65 @@ export function registerRoutes(app: FastifyInstance, deps: Deps): void {
     }
   });
 
-  app.get<{ Querystring: { limit?: string } }>("/api/v1/transactions", async (req, reply) => {
+  app.get<{ Querystring: { limit?: string; before?: string; address?: string } }>("/api/v1/transactions", async (req, reply) => {
     const chain = requireChain(reply);
     if (!chain) return;
+    const requested = Number(req.query.limit ?? 25);
+    const limit = Number.isFinite(requested) ? Math.max(1, Math.min(100, Math.floor(requested))) : 25;
+    const before = req.query.before !== undefined ? Number(req.query.before) : undefined;
+    if (before !== undefined && (!Number.isSafeInteger(before) || before < 1)) {
+      reply.code(400);
+      return { error: "before must be a positive block height" };
+    }
+    const address = req.query.address?.trim().toLowerCase();
+    const prefix = chain.meta?.bech32Prefix ?? "secret";
+    if (address !== undefined && !isAccountAddress(address, prefix)) {
+      reply.code(400);
+      return { error: `address must be a ${prefix}1… account or contract address` };
+    }
+    // Paging and address history need the index; the LCD path only knows the
+    // newest few blocks and is kept as the fallback for an empty or down yaci.
+    const page = (rows: TxSummary[]) => ({
+      next_before: rows.length === limit ? (rows[rows.length - 1]!.height ?? null) : null,
+    });
+    if (deps.yaci) {
+      try {
+        const index = await deps.yaci.range();
+        // While yaci catches up (first start, or after downtime) its newest
+        // page is stale; the live feed then comes from the LCD instead.
+        const tip = await pool.query<{ h: number | null }>(`select max(height) as h from blocks where chain_id = $1`, [chain.id]);
+        const fresh = !!index && index.latest >= Number(tip.rows[0]?.h ?? 0) - YACI_FRESH_BLOCKS;
+        if (address || before || fresh) {
+          const rows = address ? await deps.yaci.forAddress(address, { limit, before }) : await deps.yaci.recent({ limit, before });
+          // While the backfill runs, an address's older txs come from the
+          // node's own tx index, below the oldest block yaci holds.
+          if (address && index && rows.length < limit && lcd.configured) {
+            const ceiling = Math.min(index.earliest, before ?? Infinity);
+            const older = await olderForAddress
+              .get(`${address}:${ceiling}:${limit}`)
+              .catch((e) => (app.log.warn({ err: e }, "LCD address history unavailable"), []));
+            if (older.length) {
+              const all = [...rows, ...older].slice(0, limit);
+              return { transactions: await withLabels(all), source: "yaci+lcd", index, ...page(all) };
+            }
+          }
+          return { transactions: await withLabels(rows), source: "yaci", index, ...page(rows) };
+        }
+      } catch (e) {
+        app.log.warn({ err: e }, "yaci transactions unavailable");
+        if (address || before) {
+          reply.code(503);
+          return { error: "transaction index unavailable" };
+        }
+      }
+    } else if (address || before) {
+      reply.code(501);
+      return { error: "address history and paging need the yaci transaction index" };
+    }
     if (!lcd.configured) {
       reply.code(503);
       return { error: "no LCD configured" };
     }
-    const requested = Number(req.query.limit ?? 25);
-    const limit = Number.isFinite(requested) ? Math.max(1, Math.min(100, Math.floor(requested))) : 25;
     const heights = await pool.query<{ height: number }>(
       `select height from blocks where chain_id = $1 and tx_count > 0 order by height desc limit $2`,
       [chain.id, TX_BLOCKS_SCANNED],
@@ -582,7 +678,7 @@ export function registerRoutes(app: FastifyInstance, deps: Deps): void {
         out.push(...(await txsAt.get(String(height))));
         if (out.length >= limit) break;
       }
-      return { transactions: await withLabels(out.slice(0, limit)) };
+      return { transactions: await withLabels(out.slice(0, limit)), source: "lcd", index: null, next_before: null };
     } catch (e) {
       app.log.warn({ err: e }, "LCD transactions unavailable");
       reply.code(503);
@@ -599,7 +695,14 @@ export function registerRoutes(app: FastifyInstance, deps: Deps): void {
       return { error: "hash must be 64 hex characters" };
     }
     try {
-      const tx = await txByHash(lcd, hash);
+      const tx = (await deps.yaci?.byHash(hash).catch((e) => {
+        app.log.warn({ err: e }, "yaci transaction lookup failed");
+        return null;
+      })) ?? (await txByHash(lcd, hash).catch((e) => {
+        // Pruned on the main node: a deeper-history LCD may still have it.
+        if (e instanceof LcdNotFound && historyLcd.configured) return txByHash(historyLcd, hash);
+        throw e;
+      }));
       if (!tx) {
         reply.code(404);
         return { error: "transaction not found", hash };
@@ -615,6 +718,43 @@ export function registerRoutes(app: FastifyInstance, deps: Deps): void {
       app.log.warn({ err: e }, "LCD transaction unavailable");
       reply.code(503);
       return { error: "transaction data unavailable" };
+    }
+  });
+
+  /**
+   * An account's or contract's public funds: bank balances, delegations,
+   * unclaimed rewards and unbonding entries, read through the LCD and cached
+   * for about a block. Delegations carry the validator's moniker.
+   */
+  const funds = new CacheMap((addr: string) => accountFunds(lcd, addr), 6_000);
+  const monikers = new CacheMap((op: string) => validatorMoniker(lcd, op), 60 * 60_000);
+  app.get<{ Params: { address: string } }>("/api/v1/accounts/:address", async (req, reply) => {
+    const chain = requireChain(reply);
+    if (!chain) return;
+    const address = req.params.address.trim().toLowerCase();
+    const prefix = chain.meta?.bech32Prefix ?? "secret";
+    if (!isAccountAddress(address, prefix)) {
+      reply.code(400);
+      return { error: `address must be a ${prefix}1… account or contract address` };
+    }
+    if (!lcd.configured) {
+      reply.code(503);
+      return { error: "account data unavailable" };
+    }
+    try {
+      const [f, contract] = await Promise.all([funds.get(address), labels.get(address).catch(() => null)]);
+      const moniker = (op: string) => monikers.get(op).catch(() => null);
+      return {
+        address,
+        ...f,
+        delegations: await Promise.all(f.delegations.map(async (d) => ({ ...d, moniker: await moniker(d.validator) }))),
+        unbonding: await Promise.all(f.unbonding.map(async (u) => ({ ...u, moniker: await moniker(u.validator) }))),
+        contract,
+      };
+    } catch (e) {
+      app.log.warn({ err: e }, "LCD account unavailable");
+      reply.code(503);
+      return { error: "account data unavailable" };
     }
   });
 
